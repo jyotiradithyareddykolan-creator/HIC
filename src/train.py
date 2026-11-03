@@ -1,80 +1,62 @@
-"""Train the HSI ViT and select its checkpoint using validation loss."""
+"""Train a dataset-specific lightweight HSI ViT checkpoint."""
+from __future__ import annotations
+import argparse, random
 from pathlib import Path
-
-import torch
+import joblib, numpy as np, torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import random
-import joblib
-
-from pytorch_dataset import train_loader, val_loader
+from pytorch_dataset import make_loaders
 from vit_model import HSI_ViT
 
+ROOT = Path(__file__).resolve().parent.parent
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS = 30
-SEED = 42
-MODEL_CONFIG = {"input_channels": 30, "patch_size": 11, "num_classes": 16,
-                "embed_dim": 64, "num_heads": 4, "num_layers": 2, "dropout": 0.1}
-
-
-def run_epoch(model, loader, criterion, optimizer=None):
-    training = optimizer is not None
-    model.train(training)
-    loss_sum = 0.0
-    correct = total = 0
-    context = torch.enable_grad() if training else torch.no_grad()
-    with context:
+def run_epoch(model, loader, criterion, device, optimizer=None):
+    training = optimizer is not None; model.train(training); loss_sum = correct = total = 0
+    with (torch.enable_grad() if training else torch.no_grad()):
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
-            logits = model(images)
-            loss = criterion(logits, labels)
+            logits = model(images); loss = criterion(logits, labels)
             if training:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-            loss_sum += loss.item() * labels.size(0)
-            correct += (logits.argmax(1) == labels).sum().item()
-            total += labels.size(0)
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+            loss_sum += loss.item() * len(labels); correct += (logits.argmax(1) == labels).sum().item(); total += len(labels)
     return loss_sum / total, correct / total
 
-
-def main():
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-    from preprocessing import PREPROCESSOR_PATH, load_preprocessor
-    preprocessor = load_preprocessor()
-    model = HSI_ViT().to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    model_path = BASE_DIR / "models" / "hsi_vit_v2.pth"
-    best_val_loss = float("inf")
-
-    print(f"Using device: {device}")
-    print(f"Training for up to {EPOCHS} epochs; checkpoint selected on validation loss.")
-    for epoch in range(EPOCHS):
-        train_loss, train_accuracy = run_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_accuracy = run_epoch(model, val_loader, criterion)
-        print(f"Epoch [{epoch + 1}/{EPOCHS}] train loss={train_loss:.4f} accuracy={train_accuracy:.2%} | val loss={val_loss:.4f} accuracy={val_accuracy:.2%}")
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            checkpoint = {"format_version": 2, "model_state_dict": model.state_dict(),
-                          "model_config": MODEL_CONFIG, "preprocessor_path": str(PREPROCESSOR_PATH.name),
-                          "class_mapping": {str(i + 1): i for i in range(16)},
-                          "preprocessing_config": {"pca_components": 30, "patch_size": 11, "padding": "reflect"},
-                          "training_config": {"epochs": EPOCHS, "learning_rate": 0.001, "batch_size": 64,
-                                              "optimizer": "Adam", "loss": "CrossEntropyLoss"},
-                          "random_seed": SEED, "best_validation_loss": best_val_loss}
-            temporary = model_path.with_suffix(".pth.tmp")
-            torch.save(checkpoint, temporary)
-            temporary.replace(model_path)
-            print(f"  Saved best checkpoint to {model_path}")
-
+def train(data_dir=ROOT / "data", preprocessor_path=None, checkpoint_path=None, epochs=30,
+          batch_size=64, learning_rate=1e-3, embed_dim=64, num_heads=4, num_layers=2,
+          progress_callback=None):
+    data_dir = Path(data_dir)
+    preprocessor_file = Path(preprocessor_path) if preprocessor_path else ROOT / "models" / "indian_pines_preprocessor.joblib"
+    preprocessor = joblib.load(preprocessor_file)
+    train_loader, val_loader, _ = make_loaders(data_dir, batch_size)
+    sample_x, sample_y = next(iter(train_loader)); patch_size, input_channels = sample_x.shape[1], sample_x.shape[-1]
+    num_classes = int(max(sample_y.max().item() + 1, max(int(np.load(data_dir / "y_train.npy").max()), int(np.load(data_dir / "y_val.npy").max()), int(np.load(data_dir / "y_test.npy").max())) + 1))
+    config = {"input_channels": input_channels, "patch_size": patch_size, "num_classes": num_classes,
+              "embed_dim": embed_dim, "num_heads": num_heads, "num_layers": num_layers, "dropout": 0.1}
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model = HSI_ViT(**config).to(device)
+    criterion = nn.CrossEntropyLoss(); optimizer = optim.Adam(model.parameters(), lr=learning_rate); best = float("inf")
+    dataset_key = preprocessor.get("dataset_key", "custom")
+    checkpoint_path = Path(checkpoint_path or ROOT / "models" / dataset_key / f"{dataset_key}_vit.pth")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics = []
+    for epoch in range(epochs):
+        tr_loss, tr_acc = run_epoch(model, train_loader, criterion, device, optimizer)
+        va_loss, va_acc = run_epoch(model, val_loader, criterion, device)
+        metrics.append({"epoch": epoch + 1, "train_loss": tr_loss, "train_accuracy": tr_acc,
+                        "validation_loss": va_loss, "validation_accuracy": va_acc})
+        if progress_callback:
+            progress_callback(epoch + 1, epochs, metrics[-1])
+        print(f"Epoch {epoch + 1}/{epochs}: train loss={tr_loss:.4f} acc={tr_acc:.2%}; val loss={va_loss:.4f} acc={va_acc:.2%}")
+        if va_loss < best:
+            best = va_loss
+            checkpoint = {"format_version": 3, "model_state_dict": model.state_dict(), "model_config": config,
+                          "preprocessor": preprocessor, "dataset_key": dataset_key,
+                          "class_mapping": preprocessor.get("class_mapping", {}),
+                          "training_config": {"epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate},
+                          "best_validation_loss": best}
+            torch.save(checkpoint, checkpoint_path)
+    return checkpoint_path, metrics
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(); p.add_argument("--data-dir", type=Path, default=ROOT / "data"); p.add_argument("--preprocessor", type=Path)
+    p.add_argument("--checkpoint", type=Path); p.add_argument("--epochs", type=int, default=30); p.add_argument("--batch-size", type=int, default=64); p.add_argument("--learning-rate", type=float, default=1e-3)
+    a = p.parse_args(); print(f"Saved checkpoint: {train(a.data_dir, a.preprocessor, a.checkpoint, a.epochs, a.batch_size, a.learning_rate)}")

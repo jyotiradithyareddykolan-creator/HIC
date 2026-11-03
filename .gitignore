@@ -8,6 +8,11 @@ __pycache__/
 # Generated split arrays and reports
 data/X_*.npy
 data/y_*.npy
+data/*/X_*.npy
+data/*/y_*.npy
+data/*/*_metadata.joblib
 reports/
+.pytest_cache/
+pytest-cache-files-*/
 
 # Keep the trained inference artifacts available when the project is cloned.

@@ -178,3 +178,5 @@ if __name__ == "__main__":
 
     print("\nInput shape:", x.shape)
     print("Output shape:", output.shape)
+
+# End of module.
