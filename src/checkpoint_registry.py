@@ -24,7 +24,7 @@ class CheckpointRecord:
 # This is the presentation registry. Candidate names are intentionally explicit;
 # discovery never assigns one dataset's checkpoint to another dataset.
 CHECKPOINT_REGISTRY: dict[str, dict[str, Any]] = {
-    "indian_pines": {"checkpoint_names": ("indian_pines_vit.pth", "hsi_vit_v2.pth"),
+    "indian_pines": {"checkpoint_names": ("indian_pines_vit_weighted.pth", "indian_pines_vit.pth", "hsi_vit_v2.pth"),
                      "legacy_preprocessor": "hsi_preprocessor.joblib"},
     "salinas": {"checkpoint_names": ("salinas_vit.pth",)},
     "pavia_university": {"checkpoint_names": ("pavia_university_vit.pth", "paviaU_vit.pth")},
@@ -32,18 +32,24 @@ CHECKPOINT_REGISTRY: dict[str, dict[str, Any]] = {
     "botswana": {"checkpoint_names": ("botswana_vit.pth",)},
 }
 
-
-def checkpoint_status(dataset_key: str, models_dir: Path = MODELS_DIR) -> CheckpointRecord:
+def checkpoint_candidates(dataset_key: str, models_dir: Path = MODELS_DIR) -> tuple[Path, ...]:
+    """Return existing candidate files for explicit, dataset-scoped selection."""
     entry = CHECKPOINT_REGISTRY.get(dataset_key)
-    if entry is None:
-        candidate_names = (f"{dataset_key}_vit.pth",)
-    else:
-        candidate_names = tuple(entry["checkpoint_names"])
+    candidate_names = tuple(entry["checkpoint_names"]) if entry else (f"{dataset_key}_vit.pth",)
+    candidates: list[Path] = []
     for name in candidate_names:
         for path in (models_dir / dataset_key / name, models_dir / name):
-            if path.is_file():
-                legacy = dataset_key == "indian_pines" and name == "hsi_vit_v2.pth"
-                return CheckpointRecord(dataset_key, path, "available", f"Found {name}.", legacy)
+            if path.is_file() and path not in candidates:
+                candidates.append(path)
+    return tuple(candidates)
+
+
+def checkpoint_status(dataset_key: str, models_dir: Path = MODELS_DIR) -> CheckpointRecord:
+    candidates = checkpoint_candidates(dataset_key, models_dir)
+    if candidates:
+        path = candidates[0]
+        legacy = dataset_key == "indian_pines" and path.name == "hsi_vit_v2.pth"
+        return CheckpointRecord(dataset_key, path, "available", f"Found {path.name}.", legacy)
     return CheckpointRecord(dataset_key, None, "missing", "No compatible trained checkpoint is available; train this dataset first.")
 
 
@@ -79,17 +85,26 @@ def _normalise_legacy(checkpoint: dict[str, Any], path: Path, models_dir: Path) 
             "checkpoint_path": str(path)}
 
 
-def load_checkpoint(dataset_key: str, models_dir: Path = MODELS_DIR) -> dict[str, Any]:
-    record = checkpoint_status(dataset_key, models_dir)
-    if record.checkpoint_path is None:
-        raise FileNotFoundError(record.message)
-    checkpoint = _load_torch(record.checkpoint_path)
-    if record.legacy:
-        checkpoint = _normalise_legacy(checkpoint, record.checkpoint_path, models_dir)
+def load_checkpoint(dataset_key: str, models_dir: Path = MODELS_DIR,
+                    checkpoint_path: Path | str | None = None) -> dict[str, Any]:
+    if checkpoint_path is None:
+        record = checkpoint_status(dataset_key, models_dir)
+        if record.checkpoint_path is None:
+            raise FileNotFoundError(record.message)
+        selected_path = record.checkpoint_path
+        legacy = record.legacy
+    else:
+        selected_path = Path(checkpoint_path).resolve()
+        if selected_path not in checkpoint_candidates(dataset_key, models_dir):
+            raise ValueError(f"Checkpoint {selected_path.name!r} is not a registered candidate for {dataset_key!r}.")
+        legacy = dataset_key == "indian_pines" and selected_path.name == "hsi_vit_v2.pth"
+    checkpoint = _load_torch(selected_path)
+    if legacy:
+        checkpoint = _normalise_legacy(checkpoint, selected_path, models_dir)
     elif checkpoint.get("format_version") != 3:
-        raise ValueError(f"Checkpoint {record.checkpoint_path.name} is not a format-3 dataset checkpoint.")
+        raise ValueError(f"Checkpoint {selected_path.name} is not a format-3 dataset checkpoint.")
     validate_checkpoint_metadata(checkpoint, dataset_key)
-    checkpoint["checkpoint_path"] = str(record.checkpoint_path)
+    checkpoint["checkpoint_path"] = str(selected_path)
     return checkpoint
 
 

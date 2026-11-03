@@ -6,7 +6,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from checkpoint_registry import checkpoint_status, load_checkpoint, validate_checkpoint_metadata
+from checkpoint_registry import checkpoint_candidates, checkpoint_status, load_checkpoint, validate_checkpoint_metadata
 
 
 def checkpoint(dataset_key="salinas"):
@@ -32,6 +32,23 @@ def test_supported_dataset_discovery_and_reuse():
         loaded_first = load_checkpoint("salinas", tmp_path)
         loaded_second = load_checkpoint("salinas", tmp_path)
         assert loaded_first["checkpoint_path"] == loaded_second["checkpoint_path"] == str(path)
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_explicit_checkpoint_selection_is_dataset_scoped():
+    tmp_path = Path(__file__).resolve().parents[1] / ".registry_test_tmp"
+    tmp_path.mkdir(exist_ok=True)
+    try:
+        weighted = tmp_path / "indian_pines_vit_weighted.pth"
+        original = tmp_path / "indian_pines_vit.pth"
+        torch.save(checkpoint("indian_pines"), weighted)
+        torch.save(checkpoint("indian_pines"), original)
+        assert [path.name for path in checkpoint_candidates("indian_pines", tmp_path)] == [
+            "indian_pines_vit_weighted.pth", "indian_pines_vit.pth"
+        ]
+        loaded = load_checkpoint("indian_pines", tmp_path, checkpoint_path=weighted)
+        assert loaded["checkpoint_path"] == str(weighted)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

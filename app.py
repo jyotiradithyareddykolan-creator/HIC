@@ -15,10 +15,10 @@ import torch
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
-from checkpoint_registry import (CHECKPOINT_REGISTRY, checkpoint_status, load_checkpoint,
-                                 validate_checkpoint_metadata)
+from checkpoint_registry import (CHECKPOINT_REGISTRY, checkpoint_candidates, checkpoint_status,
+                                 load_checkpoint, validate_checkpoint_metadata)
 from dataset_config import colors_for, get_config, infer_config
-from demo_pipeline import (build_model, class_names, classify_cube, evaluate_map,
+from demo_pipeline import (build_model, class_names, classify_cube, evaluate_prepared_test,
                            false_color_image, validate_for_cube)
 from preprocessing import load_dataset, mat_variables
 
@@ -29,8 +29,8 @@ st.caption("A dataset-specific Vision Transformer pipeline: MATLAB loading → t
 
 
 @st.cache_resource(show_spinner=False)
-def cached_checkpoint(dataset_key: str, models_dir: str):
-    checkpoint = load_checkpoint(dataset_key, Path(models_dir))
+def cached_checkpoint(dataset_key: str, checkpoint_path: str, file_mtime_ns: int, file_size: int):
+    checkpoint = load_checkpoint(dataset_key, ROOT / "models", Path(checkpoint_path))
     return checkpoint, build_model(checkpoint)
 
 
@@ -128,6 +128,8 @@ dataset_key = config.key if config else "custom"
 dataset_signature = hashlib.sha256(image_bytes + (label_bytes or b"") + image_variable.encode("utf-8") + dataset_key.encode("utf-8")).hexdigest()
 if st.session_state.get("dataset_signature") != dataset_signature:
     st.session_state.pop("prediction", None)
+    st.session_state.pop("prediction_signature", None)
+    st.session_state.pop("evaluation_metrics", None)
     st.session_state["dataset_signature"] = dataset_signature
 label_count = len(np.unique(labels)) - (1 if labels is not None and 0 in labels else 0) if labels is not None else None
 st.subheader(config.name if config else "Custom compatible dataset")
@@ -162,12 +164,27 @@ if labels is not None:
     fig, ax = plt.subplots(figsize=(7, 5)); ax.imshow(labels, cmap="tab20"); ax.axis("off"); st.pyplot(fig); plt.close(fig)
 
 record = checkpoint_status(dataset_key) if dataset_key != "custom" else checkpoint_status("custom")
+candidate_paths = list(checkpoint_candidates(dataset_key)) if dataset_key != "custom" else []
 checkpoint = model = None
-if record.checkpoint_path is not None:
+selected_checkpoint_path = None
+if candidate_paths:
+    checkpoint_names = [path.name for path in candidate_paths]
+    selected_checkpoint_name = st.selectbox("Model checkpoint", checkpoint_names, key=f"checkpoint_selection_{dataset_key}")
+    selected_checkpoint_path = next(path for path in candidate_paths if path.name == selected_checkpoint_name)
+    checkpoint_stat = selected_checkpoint_path.stat()
+    checkpoint_identity = f"{dataset_signature}:{selected_checkpoint_path}:{checkpoint_stat.st_mtime_ns}:{checkpoint_stat.st_size}"
+else:
+    checkpoint_identity = f"{dataset_signature}:none"
+if st.session_state.get("prediction_signature") != checkpoint_identity:
+    st.session_state.pop("prediction", None)
+    st.session_state.pop("evaluation_metrics", None)
+    st.session_state["prediction_signature"] = checkpoint_identity
+if selected_checkpoint_path is not None:
     try:
-        checkpoint, model = cached_checkpoint(dataset_key, str(ROOT / "models"))
+        checkpoint, model = cached_checkpoint(dataset_key, str(selected_checkpoint_path), checkpoint_stat.st_mtime_ns, checkpoint_stat.st_size)
         validate_for_cube(checkpoint, dataset_key, image.shape[2])
         st.success("A compatible trained model is loaded for this dataset.")
+        st.caption(f"Active checkpoint: {selected_checkpoint_path.name}")
         st.caption(f"Architecture: {checkpoint['model_config']} · PCA: {checkpoint['preprocessor']['n_components']} components · patch: {checkpoint['preprocessor']['patch_size']}×{checkpoint['preprocessor']['patch_size']}")
     except (FileNotFoundError, KeyError, RuntimeError, ValueError) as exc:
         st.error(f"A checkpoint was found but failed compatibility validation: {exc}")
@@ -177,7 +194,11 @@ if checkpoint_override is not None:
         validate_checkpoint_metadata(uploaded_checkpoint, dataset_key)
         validate_for_cube(uploaded_checkpoint, dataset_key, image.shape[2])
         checkpoint, model = uploaded_checkpoint, build_model(uploaded_checkpoint)
+        checkpoint["checkpoint_path"] = checkpoint_override.name
+        st.session_state.pop("prediction", None)
+        st.session_state.pop("evaluation_metrics", None)
         st.success("Compatible uploaded checkpoint loaded for this dataset.")
+        st.caption(f"Active checkpoint: {checkpoint_override.name}")
     except (KeyError, RuntimeError, ValueError) as exc:
         st.error(f"Uploaded checkpoint is incompatible: {exc}")
 if checkpoint is None:
@@ -188,6 +209,7 @@ if checkpoint is not None and model is not None:
         with st.spinner("Classifying the full cube with the cached model..."):
             prediction = classify_cube(image, checkpoint, model, int(batch_size))
         st.session_state["prediction"] = prediction
+        st.session_state["prediction_signature"] = checkpoint_identity
 
 prediction = st.session_state.get("prediction")
 if prediction is not None and checkpoint is not None:
@@ -198,35 +220,41 @@ if prediction is not None and checkpoint is not None:
     legend = [{"Class ID": index + 1, "Class": name, "Color": colors[index]} for index, name in enumerate(names)]
     st.dataframe(legend, hide_index=True, use_container_width=True)
     if labels is not None:
-        try:
-            metrics = evaluate_map(prediction, labels, checkpoint)
-            st.subheader("Ground Truth vs Prediction")
-            mapping = {int(raw): int(index) for raw, index in checkpoint["class_mapping"].items()}
-            mapped_truth = np.full(labels.shape, -1, dtype=np.int64)
-            for raw, index in mapping.items():
-                mapped_truth[labels == raw] = index
-            comparison_left, comparison_right = st.columns(2)
-            with comparison_left:
-                fig, ax = plt.subplots(figsize=(6, 4)); ax.imshow(mapped_truth, cmap=ListedColormap(colors), vmin=-1, vmax=len(names) - 1); ax.set_title("Ground truth (model class indices)"); ax.axis("off"); st.pyplot(fig); plt.close(fig)
-            with comparison_right:
-                agreement = np.where(mapped_truth >= 0, prediction == mapped_truth, -1)
-                fig, ax = plt.subplots(figsize=(6, 4)); ax.imshow(agreement, cmap="RdYlGn", vmin=-1, vmax=1); ax.set_title("Agreement: red=incorrect, green=correct"); ax.axis("off"); st.pyplot(fig); plt.close(fig)
-            st.subheader("Evaluation Results")
-            metric_left, metric_mid, metric_right = st.columns(3)
-            metric_left.metric("Overall Accuracy", f"{metrics['overall_accuracy']:.2%}")
-            metric_mid.metric("Average Accuracy", f"{metrics['average_accuracy']:.2%}")
-            metric_right.metric("Cohen's Kappa", f"{metrics['kappa']:.4f}")
-            st.caption(f"Evaluated labeled pixels: {metrics['evaluated_pixels']:,}")
-            st.dataframe([{"Class": names[index], "Accuracy": f"{value:.2%}"} for index, value in enumerate(metrics["per_class_accuracy"])], hide_index=True)
-            st.write("Confusion matrix (rows = true class, columns = predicted class)")
-            st.dataframe(metrics["confusion_matrix"], use_container_width=True)
-            report_rows = []
-            for index, name in enumerate(names):
-                row = metrics["classification_report"].get(str(index), {})
-                report_rows.append({"Class": name, "Precision": row.get("precision", 0.0), "Recall": row.get("recall", 0.0), "F1": row.get("f1-score", 0.0), "Support": row.get("support", 0)})
-            st.dataframe(report_rows, hide_index=True, use_container_width=True)
-        except ValueError as exc:
-            st.info(f"Accuracy is unavailable: {exc}")
+        st.subheader("Evaluation Results")
+        prepared_test_dir = ROOT / "data" / dataset_key
+        if checkpoint_override is None and (prepared_test_dir / "X_test.npy").is_file() and (prepared_test_dir / "y_test.npy").is_file():
+            try:
+                metrics = evaluate_prepared_test(prepared_test_dir, checkpoint, model, int(batch_size))
+                st.session_state["evaluation_metrics"] = metrics
+                st.caption("Metrics are computed from the saved held-out test split for the active checkpoint.")
+                metric_left, metric_mid, metric_right, metric_f1 = st.columns(4)
+                metric_left.metric("Overall Accuracy", f"{metrics['overall_accuracy']:.2%}")
+                metric_mid.metric("Average Accuracy", f"{metrics['average_accuracy']:.2%}")
+                metric_right.metric("Cohen's Kappa", f"{metrics['kappa']:.4f}")
+                macro_f1 = metrics["classification_report"].get("macro avg", {}).get("f1-score")
+                metric_f1.metric("Macro F1-score", f"{macro_f1:.2%}" if macro_f1 is not None else "Unavailable")
+                st.caption(f"Held-out test pixels: {metrics['evaluated_pixels']:,}")
+                with st.expander("Per-class evaluation report", expanded=True):
+                    report_rows = []
+                    for index, name in enumerate(names):
+                        row = metrics["classification_report"].get(str(index), {})
+                        report_rows.append({"Class": name,
+                                            "Accuracy": f"{metrics['per_class_accuracy'][index]:.2%}",
+                                            "Precision": row.get("precision", 0.0),
+                                            "Recall": row.get("recall", 0.0),
+                                            "F1": row.get("f1-score", 0.0),
+                                            "Support": row.get("support", 0)})
+                    st.dataframe(report_rows, hide_index=True, use_container_width=True)
+                with st.expander("Confusion matrix", expanded=False):
+                    st.caption("Rows are true classes; columns are predicted classes.")
+                    st.dataframe(metrics["confusion_matrix"], use_container_width=True)
+            except (OSError, ValueError) as exc:
+                st.info(f"Held-out evaluation is unavailable: {exc}")
+        else:
+            st.info("Evaluation metrics are unavailable. Run evaluation on labeled test data first.")
+    else:
+        st.subheader("Evaluation Results")
+        st.info("Evaluation metrics are unavailable. Run evaluation on labeled test data first.")
     buffer = io.BytesIO(); np.save(buffer, prediction)
     st.download_button("Download prediction map (.npy)", buffer.getvalue(), "prediction_map.npy")
 

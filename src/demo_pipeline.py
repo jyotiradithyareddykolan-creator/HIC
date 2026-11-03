@@ -12,6 +12,34 @@ from preprocessing import iter_patch_batches, transform_image
 from vit_model import HSI_ViT
 
 
+def _classification_metrics(actual: np.ndarray, predicted: np.ndarray, count: int) -> dict[str, Any]:
+    matrix = confusion_matrix(actual, predicted, labels=list(range(count)))
+    per_class = np.divide(np.diag(matrix), matrix.sum(axis=1), out=np.zeros(count, dtype=float), where=matrix.sum(axis=1) != 0)
+    return {"overall_accuracy": float(np.mean(actual == predicted)), "average_accuracy": float(np.mean(per_class)),
+            "kappa": float(cohen_kappa_score(actual, predicted, labels=list(range(count)))),
+            "per_class_accuracy": per_class, "confusion_matrix": matrix,
+            "classification_report": classification_report(actual, predicted, labels=list(range(count)), output_dict=True, zero_division=0),
+            "evaluated_pixels": int(len(actual))}
+
+
+def evaluate_prepared_test(data_dir, checkpoint: dict[str, Any], model: HSI_ViT,
+                           batch_size: int = 256) -> dict[str, Any]:
+    """Evaluate on the saved held-out test patches for this checkpoint."""
+    from pathlib import Path
+    data_dir = Path(data_dir)
+    x = np.load(data_dir / "X_test.npy", mmap_mode="r")
+    actual = np.load(data_dir / "y_test.npy")
+    if x.ndim != 4 or actual.ndim != 1 or len(x) != len(actual):
+        raise ValueError("Prepared held-out test split is malformed.")
+    predicted_batches = []
+    with torch.inference_mode():
+        for start in range(0, len(actual), batch_size):
+            batch = torch.from_numpy(np.array(x[start:start + batch_size], copy=True)).float()
+            predicted_batches.append(model(batch).argmax(1).cpu().numpy())
+    predicted = np.concatenate(predicted_batches).astype(np.int64)
+    return _classification_metrics(actual.astype(np.int64), predicted, int(checkpoint["model_config"]["num_classes"]))
+
+
 def build_model(checkpoint: dict[str, Any]) -> HSI_ViT:
     model = HSI_ViT(**checkpoint["model_config"])
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -61,13 +89,7 @@ def evaluate_map(prediction: np.ndarray, labels: np.ndarray, checkpoint: dict[st
     actual = np.array([mapping[int(value)] for value in raw[known]], dtype=np.int64)
     predicted = prediction[valid][known]
     count = int(checkpoint["model_config"]["num_classes"])
-    matrix = confusion_matrix(actual, predicted, labels=list(range(count)))
-    per_class = np.divide(np.diag(matrix), matrix.sum(axis=1), out=np.zeros(count, dtype=float), where=matrix.sum(axis=1) != 0)
-    report = classification_report(actual, predicted, labels=list(range(count)), output_dict=True, zero_division=0)
-    return {"overall_accuracy": float(np.mean(actual == predicted)), "average_accuracy": float(np.mean(per_class)),
-            "kappa": float(cohen_kappa_score(actual, predicted, labels=list(range(count)))),
-            "per_class_accuracy": per_class, "confusion_matrix": matrix,
-            "classification_report": report, "evaluated_pixels": int(len(actual))}
+    return _classification_metrics(actual, predicted, count)
 
 
 def class_names(config: DatasetConfig | None, checkpoint: dict[str, Any]) -> list[str]:
